@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(github.com)",
+      "Bash(git init)",
+      "Bash(copy *)",
+      "Bash(dir *)",
+      "Bash(git add *)"
+    ]
+  },
+  "$version": 3
+}
