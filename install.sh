@@ -2,8 +2,8 @@
 set -e
 
 # ══════════════════════════════════════════════════════════════
-#  WARP Manager v2.3 — Установка на сервер
-#  Cloudflare WARP · 3X-UI + AmneziaWG · Telegram Bot
+#  WARP Manager v2.4 — Установка на сервер
+#  Cloudflare WARP · 3X-UI (Native Wireguard) + AmneziaWG
 # ══════════════════════════════════════════════════════════════
 
 RED='\033[0;31m'
@@ -18,7 +18,7 @@ INSTALL_DIR="/etc/warp-manager"
 BIN_PATH="/usr/local/bin/gowarp"
 
 echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${WHITE}  WARP Manager v2.3 — Установка${NC}"
+echo -e "${WHITE}  WARP Manager v2.4 — Установка${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 
 # Проверка root
@@ -49,7 +49,7 @@ fi
 echo -e "${YELLOW}[1/5]${NC} Проверка зависимостей..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y > /dev/null 2>&1
-for pkg in curl jq wget; do
+for pkg in curl jq wget sqlite3; do
     if ! command -v "$pkg" &>/dev/null; then
         echo -e "  ${YELLOW}Установка ${pkg}...${NC}"
         apt-get install -y "$pkg" > /dev/null 2>&1

@@ -2,12 +2,11 @@
 set -o pipefail
 
 # ══════════════════════════════════════════════════════════════
-#  WARP Manager v2.3 — Unified 3X-UI + AmneziaWG
-#  Cloudflare WARP · Telegram Bot · Auto-detect mode
-#  Улучшенная версия: смена IP, без рекламы, чистый код
+#  WARP Manager v2.4 — Unified 3X-UI + AmneziaWG
+#  Cloudflare WARP (Native Xray Wireguard) · Telegram Bot
 # ══════════════════════════════════════════════════════════════
 
-WARP_VERSION="2.3"
+WARP_VERSION="2.4"
 WARP_DIR="/etc/warp-manager"
 WARP_CONF="$WARP_DIR/config"
 WARP_LOG="/var/log/warp-manager.log"
@@ -18,6 +17,8 @@ WGCF_VERSION="2.2.30"
 WGCF_BIN="/root/wgcf"
 WGCF_ACCOUNT="/root/wgcf-account.toml"
 WGCF_PROFILE="/root/wgcf-profile.conf"
+
+XUI_DB="/etc/x-ui/x-ui.db"
 
 AWG_WARP_DIR="/opt/warp"
 AWG_WARP_CONF="$AWG_WARP_DIR/warp.conf"
@@ -108,17 +109,17 @@ has_standalone_mode() { [[ "$MODE" == "standalone" ]]; }
 mode_label() {
     case "${1:-$MODE}" in
         amnezia) echo "AmneziaWG" ;;
-        both) echo "SOCKS5 / Custom Client + AmneziaWG" ;;
+        both) echo "3X-UI Native WG + AmneziaWG" ;;
         standalone) echo "Standalone" ;;
-        *) echo "SOCKS5 / Custom Client" ;;
+        *) echo "3X-UI Native WG" ;;
     esac
 }
 
 choose_mode_interactive() {
-    echo -e "  ${GREEN}1)${NC} SOCKS5 / Custom Client"
-    echo -e "      ${DIM}Для 3X-UI, TrustTunnel и любых сервисов/клиентов, которые умеют работать через SOCKS5${NC}"
+    echo -e "  ${GREEN}1)${NC} 3X-UI (Native Wireguard Outbound)"
+    echo -e "      ${DIM}Автоматический инжект WARP напрямую в базу Xray (x-ui.db)${NC}"
     echo -e "  ${GREEN}2)${NC} AmneziaWG (Docker WireGuard)"
-    echo -e "  ${GREEN}3)${NC} Оба режима"
+    echo -e "  ${GREEN}3)${NC} Оба режима (3X-UI + AmneziaWG)"
     echo -e "  ${GREEN}4)${NC} Только WARP (standalone)"
     while true; do
         read -p "Выберите режим (1/2/3/4): " choice
@@ -187,11 +188,11 @@ check_root() {
 }
 
 check_deps() {
-    for cmd in jq curl; do
+    for cmd in jq curl sqlite3; do
         if ! command -v "$cmd" &>/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -y > /dev/null 2>&1
-            apt-get install -y jq curl > /dev/null 2>&1
+            apt-get install -y jq curl sqlite3 > /dev/null 2>&1
             break
         fi
     done
@@ -239,30 +240,210 @@ is_ip_changed() {
     [ "$new_ip" != "$old_ip" ]
 }
 
-rotate_warp_ip_once_3xui() {
-    ROTATE_LAST_IP="N/A"
-    ROTATE_LAST_ERROR=""
-    warp-cli --accept-tos disconnect > /dev/null 2>&1 || true
-    sleep 2
-    warp-cli --accept-tos registration delete > /dev/null 2>&1 || true
-    sleep 2
-    if ! warp-cli --accept-tos registration new > /dev/null 2>&1; then
-        ROTATE_LAST_ERROR="registration"
-        return 1
-    fi
-    sleep 2
-    warp-cli --accept-tos mode proxy > /dev/null 2>&1 || true
-    warp-cli --accept-tos proxy port "${SOCKS_PORT}" > /dev/null 2>&1 || true
-    if ! warp-cli --accept-tos connect > /dev/null 2>&1; then
-        ROTATE_LAST_ERROR="connect"
-        return 1
-    fi
-    sleep 5
-    is_warp_running_3xui || { ROTATE_LAST_ERROR="not_running"; return 1; }
-    ROTATE_LAST_IP=$(get_warp_ip_3xui)
-    is_valid_warp_ip "$ROTATE_LAST_IP" || { ROTATE_LAST_ERROR="ip_unavailable"; return 1; }
-    return 0
+# ═══════════════════════════════════════════════════════════════
+#  WGCF HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+wgcf_install() {
+    if [ -x "$WGCF_BIN" ]; then return 0; fi
+    local arch; arch=$(uname -m)
+    local wa=""
+    case "$arch" in
+        x86_64) wa="amd64" ;; aarch64) wa="arm64" ;; armv7l) wa="armv7" ;;
+        *) echo -e "${RED}Архитектура не поддерживается: $arch${NC}"; return 1 ;;
+    esac
+    wget -q -O "$WGCF_BIN" "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${wa}" \
+        || { echo -e "${RED}Не удалось скачать wgcf.${NC}"; return 1; }
+    chmod +x "$WGCF_BIN"
 }
+
+wgcf_ensure_account() {
+    if [ ! -f "$WGCF_ACCOUNT" ]; then
+        echo -e "${YELLOW}Регистрация аккаунта Cloudflare WARP...${NC}"
+        (cd /root && yes | ./wgcf register 2>/dev/null)
+    fi
+    [ -f "$WGCF_ACCOUNT" ] || { echo -e "${RED}Файл аккаунта не создан: $WGCF_ACCOUNT${NC}"; return 1; }
+}
+
+wgcf_generate_profile() {
+    (cd /root && yes | ./wgcf generate 2>/dev/null)
+    [ -f "$WGCF_PROFILE" ] || { echo -e "${RED}Не создан профиль WG.${NC}"; return 1; }
+}
+
+wgcf_resolve_endpoint() {
+    local ep; ep=$(getent ahostsv4 engage.cloudflareclient.com 2>/dev/null | awk 'NR==1{print $1}')
+    [ -z "$ep" ] && { echo -e "${RED}Не удалось определить IP endpoint.${NC}"; return 1; }
+    echo "$ep"
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  3X-UI BACKEND — WARP via NATIVE XRAY WIREGUARD OUTBOUND
+# ═══════════════════════════════════════════════════════════════
+
+is_warp_installed_3xui() {
+    if [ ! -f "$XUI_DB" ]; then return 1; fi
+    local template
+    template=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null)
+    echo "$template" | grep -q '"tag": "WARP"' && return 0 || return 1
+}
+
+is_warp_running_3xui() {
+    systemctl is-active x-ui >/dev/null 2>&1 && is_warp_installed_3xui
+}
+
+get_warp_status_3xui() {
+    if ! is_warp_installed_3xui; then echo "Не установлен"; return; fi
+    if systemctl is-active x-ui >/dev/null 2>&1; then echo "Интегрирован в Xray"; else echo "Отключён (Xray не работает)"; fi
+}
+
+get_warp_ip_3xui() {
+    echo "Маршрутизируется Xray"
+}
+
+install_warp_3xui() {
+    clear; echo -e "\n${CYAN}━━━ Установка Cloudflare WARP (3X-UI Native) ━━━${NC}\n"
+    if is_warp_installed_3xui; then
+        echo -e "${YELLOW}WARP уже внедрён в базу 3X-UI.${NC}"; read -p "Enter..."; return
+    fi
+    if [ ! -f "$XUI_DB" ]; then
+        echo -e "${RED}База данных 3X-UI не найдена по пути $XUI_DB.${NC}"; read -p "Enter..."; return
+    fi
+
+    echo -e "${YELLOW}[1/5]${NC} Установка wgcf..."
+    wgcf_install || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+
+    echo -e "${YELLOW}[2/5]${NC} Регистрация аккаунта..."
+    wgcf_ensure_account || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+
+    echo -e "${YELLOW}[3/5]${NC} Генерация профиля WG..."
+    wgcf_generate_profile || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+
+    echo -e "${YELLOW}[4/5]${NC} Определение Endpoint..."
+    local ep; ep=$(wgcf_resolve_endpoint) || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓ ${ep}${NC}"
+
+    echo -e "${YELLOW}[5/5]${NC} Инжект конфигурации в x-ui.db..."
+    
+    local pk pub addrs ipv4 ipv6
+    pk=$(awk -F' = ' '/^PrivateKey/{print $2}' "$WGCF_PROFILE")
+    pub=$(awk -F' = ' '/^PublicKey/{print $2}' "$WGCF_PROFILE")
+    addrs=$(awk -F' = ' '/^Address/{print $2}' "$WGCF_PROFILE" | tr ',' '\n' | tr -d ' ')
+    ipv4=$(echo "$addrs" | grep "\." | head -n1 | cut -d'/' -f1)
+    ipv6=$(echo "$addrs" | grep ":" | head -n1 | cut -d'/' -f1)
+
+    sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='xrayTemplateConfig';" > /tmp/xui_template.json
+
+    jq --arg pk "$pk" --arg pub "$pub" --arg ipv4 "$ipv4/32" --arg ipv6 "$ipv6/128" --arg ep "$ep:2408" '
+      .outbounds = (.outbounds | map(select(.tag != "WARP"))) |
+      .routing.rules = (.routing.rules | map(select(.outboundTag != "WARP"))) |
+      .outbounds += [{
+        "tag": "WARP",
+        "protocol": "wireguard",
+        "settings": {
+          "secretKey": $pk,
+          "address": [ $ipv4, $ipv6 ],
+          "peers": [{ "publicKey": $pub, "endpoint": $ep }],
+          "mtu": 1280
+        }
+      }] |
+      .routing.rules += [{
+        "type": "field",
+        "outboundTag": "WARP",
+        "domain": ["geosite:google", "geosite:openai", "geosite:netflix", "geosite:instagram", "domain:chat.openai.com", "domain:claude.ai"]
+      }]
+    ' /tmp/xui_template.json > /tmp/xui_new.json
+
+    local escaped_json; escaped_json=$(sed "s/'/''/g" /tmp/xui_new.json)
+    sqlite3 "$XUI_DB" "UPDATE settings SET value='${escaped_json}' WHERE key='xrayTemplateConfig';"
+    
+    systemctl restart x-ui
+    echo -e "${GREEN}  ✓ Конфигурация успешно обновлена и панель перезапущена.${NC}"
+    log_action "3XUI INSTALL: Native Wireguard Outbound Injected."
+    
+    rm -f /tmp/xui_template.json /tmp/xui_new.json
+    read -p "Enter..."
+}
+
+start_warp_3xui() {
+    is_warp_installed_3xui && { echo -e "\n${YELLOW}WARP уже встроен в 3X-UI.${NC}"; read -p "Enter..."; return; }
+    install_warp_3xui
+}
+
+stop_warp_3xui() {
+    is_warp_installed_3xui || { echo -e "\n${RED}WARP не установлен в 3X-UI.${NC}"; read -p "Enter..."; return; }
+    echo -e "\n${YELLOW}Удаление WARP из конфигурации Xray...${NC}"
+    
+    sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='xrayTemplateConfig';" > /tmp/xui_template.json
+    jq '
+      .outbounds = (.outbounds | map(select(.tag != "WARP"))) |
+      .routing.rules = (.routing.rules | map(select(.outboundTag != "WARP")))
+    ' /tmp/xui_template.json > /tmp/xui_new.json
+    
+    local escaped_json; escaped_json=$(sed "s/'/''/g" /tmp/xui_new.json)
+    sqlite3 "$XUI_DB" "UPDATE settings SET value='${escaped_json}' WHERE key='xrayTemplateConfig';"
+    
+    systemctl restart x-ui
+    echo -e "${GREEN}[OK] WARP удалён из панели.${NC}"; log_action "3XUI STOP (Removed from DB)"
+    rm -f /tmp/xui_template.json /tmp/xui_new.json
+    read -p "Enter..."
+}
+
+rekey_warp_3xui() {
+    is_warp_installed_3xui || { echo -e "\n${RED}WARP не установлен в 3X-UI.${NC}"; read -p "Enter..."; return; }
+    echo -e "\n${CYAN}━━━ Перевыпуск ключа WARP (3X-UI) ━━━${NC}\n"
+    read -p "Продолжить? (y/n): " c; [[ "$c" != "y" ]] && return
+    
+    rm -f "$WGCF_ACCOUNT"
+    wgcf_ensure_account || { read -p "Enter..."; return; }
+    wgcf_generate_profile || { read -p "Enter..."; return; }
+    
+    stop_warp_3xui > /dev/null 2>&1
+    install_warp_3xui > /dev/null 2>&1
+    
+    echo -e "${GREEN}  ✓ Новый аккаунт WARP сгенерирован и внедрён.${NC}"; log_action "3XUI REKEY Native WG"
+    read -p "Enter..."
+}
+
+change_warp_ip_3xui() {
+    rekey_warp_3xui
+}
+
+show_status_3xui() {
+    clear; echo -e "\n${CYAN}━━━ Статус WARP (3X-UI Native) ━━━${NC}\n"
+    if ! is_warp_installed_3xui; then
+        echo -e "  ${RED}Не установлен.${NC} Установите через п.1."; echo ""; read -p "Enter..."; return
+    fi
+    echo -e "  ${WHITE}Статус:      ${GREEN}Интегрирован в X-UI (Wireguard Outbound)${NC}"
+    echo -e "  ${WHITE}Реальный IP: ${GREEN}${MY_IP}${NC}"
+    echo -e "\n${WHITE}Настройки маршрутизации (Routing) можно редактировать напрямую в панели 3X-UI.${NC}"
+    echo ""; read -p "Enter..."
+}
+
+show_3xui_menu() {
+    clear; echo -e "\n${CYAN}━━━ Инструкция WARP (3X-UI Native) ━━━${NC}\n"
+    echo -e "${WHITE}В данной версии WARP Manager интеграция SOCKS5 упразднена.${NC}"
+    echo -e "${GREEN}WARP автоматически добавлен как Outbound в базу данных 3X-UI.${NC}\n"
+    echo -e "Если вы хотите изменить, какие сайты идут через WARP:"
+    echo -e "  1. Откройте панель 3X-UI."
+    echo -e "  2. Перейдите в Settings -> Routing Rules."
+    echo -e "  3. Найдите правило с Outbound Tag: WARP."
+    echo -e "  4. Отредактируйте список доменов (Domain) по своему желанию."
+    echo -e "  5. Сохраните и перезапустите Xray."
+    echo ""; read -p "Enter..."
+}
+
+uninstall_3xui() {
+    echo -e "\n${YELLOW}Удаление WARP (3X-UI Native)...${NC}\n"
+    stop_warp_3xui >/dev/null 2>&1
+    systemctl stop warp-bot 2>/dev/null; systemctl disable warp-bot 2>/dev/null
+    rm -f /etc/systemd/system/warp-bot.service; systemctl daemon-reload 2>/dev/null
+    [ -f "$BOT_PID_FILE" ] && { kill "$(cat "$BOT_PID_FILE")" 2>/dev/null; rm -f "$BOT_PID_FILE"; }
+    echo -e "  ${GREEN}✓${NC}  Бот остановлен"
+    echo -e "  ${GREEN}✓${NC}  Конфигурация удалена из базы 3X-UI"
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  STANDALONE MODE — WARP via warp-cli (no panels)
+# ═══════════════════════════════════════════════════════════════
 
 rotate_warp_ip_once_standalone() {
     ROTATE_LAST_IP="N/A"
@@ -288,405 +469,6 @@ rotate_warp_ip_once_standalone() {
     is_valid_warp_ip "$ROTATE_LAST_IP" || { ROTATE_LAST_ERROR="ip_unavailable"; return 1; }
     return 0
 }
-
-rotate_warp_ip_once_awg() {
-    ROTATE_LAST_IP="N/A"
-    ROTATE_LAST_ERROR=""
-    docker exec "$CONTAINER" sh -c "wg-quick down '$AWG_WARP_CONF' 2>/dev/null || true"
-    sleep 2
-    rm -f "$WGCF_ACCOUNT"
-    awg_ensure_account || { ROTATE_LAST_ERROR="registration"; return 1; }
-    awg_generate_profile || { ROTATE_LAST_ERROR="profile"; return 1; }
-    local ep
-    ep=$(awg_resolve_endpoint) || { ROTATE_LAST_ERROR="endpoint"; return 1; }
-    awg_build_warp_conf "$ep" || { ROTATE_LAST_ERROR="build_conf"; return 1; }
-    awg_warp_up > /dev/null 2>&1 || { ROTATE_LAST_ERROR="connect"; return 1; }
-    sleep 3
-    awg_apply_rules
-    awg_patch_start_sh
-    awg_detect_warp_exit_ip
-    ROTATE_LAST_IP="${AWG_WARP_EXIT_IP:-N/A}"
-    is_valid_warp_ip "$ROTATE_LAST_IP" || { ROTATE_LAST_ERROR="ip_unavailable"; return 1; }
-    return 0
-}
-
-# ═══════════════════════════════════════════════════════════════
-#  3X-UI BACKEND — WARP via warp-cli (SOCKS5)
-# ═══════════════════════════════════════════════════════════════
-
-is_warp_installed_3xui() { command -v warp-cli &>/dev/null; }
-
-is_warp_running_3xui() {
-    local st; st=$(warp-cli --accept-tos status 2>/dev/null)
-    echo "$st" | grep -qi "status.*connected" && ! echo "$st" | grep -qi "disconnected"
-}
-
-get_warp_status_3xui() {
-    if ! is_warp_installed_3xui; then echo "Не установлен"; return; fi
-    local s; s=$(warp-cli --accept-tos status 2>/dev/null | head -5)
-    if echo "$s" | grep -qi "disconnected"; then echo "Отключён"
-    elif echo "$s" | grep -qi "connected"; then echo "Подключён"
-    elif echo "$s" | grep -qi "registration missing"; then echo "Нет регистрации"
-    else echo "Неизвестно"; fi
-}
-
-get_warp_ip_3xui() {
-    curl -s4 --max-time 5 --proxy socks5h://127.0.0.1:${SOCKS_PORT} ifconfig.me 2>/dev/null || echo "N/A"
-}
-
-install_warp_3xui() {
-    clear; echo -e "\n${CYAN}━━━ Установка Cloudflare WARP (3X-UI) ━━━${NC}\n"
-    if is_warp_installed_3xui; then
-        echo -e "${YELLOW}WARP уже установлен.${NC}"; read -p "Enter..."; return
-    fi
-    detect_os
-    if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
-        echo -e "${RED}Поддерживаются только Ubuntu и Debian (ваша: ${OS_ID}).${NC}"; read -p "Enter..."; return
-    fi
-    echo -e "${YELLOW}[1/6]${NC} GPG-ключ Cloudflare..."
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null \
-        || { echo -e "${RED}Ошибка GPG.${NC}"; read -p "Enter..."; return; }
-    echo -e "${GREEN}  ✓${NC}"
-
-    echo -e "${YELLOW}[2/6]${NC} Репозиторий..."
-    local codename="${OS_CODENAME:-$(lsb_release -cs 2>/dev/null || echo focal)}"
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" \
-        > /etc/apt/sources.list.d/cloudflare-client.list
-    echo -e "${GREEN}  ✓ (${codename})${NC}"
-
-    echo -e "${YELLOW}[3/6]${NC} Установка cloudflare-warp..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y > /dev/null 2>&1; apt-get install -y cloudflare-warp > /dev/null 2>&1
-    command -v warp-cli &>/dev/null || { echo -e "${RED}Не удалось установить.${NC}"; read -p "Enter..."; return; }
-    echo -e "${GREEN}  ✓${NC}"
-
-    echo -e "${YELLOW}[4/6]${NC} Регистрация..."
-    warp-cli --accept-tos registration new > /dev/null 2>&1 || { echo -e "${RED}Ошибка регистрации.${NC}"; read -p "Enter..."; return; }
-    echo -e "${GREEN}  ✓${NC}"
-
-    echo -e "${YELLOW}[5/6]${NC} SOCKS5-прокси..."
-    warp-cli --accept-tos mode proxy > /dev/null 2>&1
-    warp-cli --accept-tos proxy port "${SOCKS_PORT}" > /dev/null 2>&1
-    echo -e "${GREEN}  ✓ 127.0.0.1:${SOCKS_PORT}${NC}"
-
-    echo -e "${YELLOW}[6/6]${NC} Подключение..."
-    warp-cli --accept-tos connect > /dev/null 2>&1; sleep 3
-    if is_warp_running_3xui; then
-        local wip; wip=$(get_warp_ip_3xui)
-        echo -e "${GREEN}  ✓ WARP IP: ${wip}${NC}"
-        log_action "3XUI INSTALL: port=${SOCKS_PORT}, warp_ip=${wip}"
-    else
-        echo -e "${YELLOW}  ⚠ Подключение не подтверждено.${NC}"
-    fi
-    echo -e "\n${WHITE}Настройка 3X-UI: п.${YELLOW}6${WHITE} (JSON, инструкция, порт)${NC}"
-    read -p "Enter..."
-}
-
-start_warp_3xui() {
-    is_warp_installed_3xui || { echo -e "\n${RED}WARP не установлен.${NC}"; read -p "Enter..."; return; }
-    is_warp_running_3xui && { echo -e "\n${YELLOW}Уже подключён.${NC}"; read -p "Enter..."; return; }
-    echo -e "\n${YELLOW}Подключение...${NC}"
-    warp-cli --accept-tos connect > /dev/null 2>&1; sleep 3
-    if is_warp_running_3xui; then
-        echo -e "${GREEN}[OK] Подключён.${NC}"; log_action "3XUI START"
-    else
-        echo -e "${RED}Ошибка подключения.${NC}"
-    fi
-    read -p "Enter..."
-}
-
-stop_warp_3xui() {
-    is_warp_installed_3xui || { echo -e "\n${RED}WARP не установлен.${NC}"; read -p "Enter..."; return; }
-    is_warp_running_3xui || { echo -e "\n${YELLOW}Уже отключён.${NC}"; read -p "Enter..."; return; }
-    warp-cli --accept-tos disconnect > /dev/null 2>&1
-    echo -e "${GREEN}[OK] Отключён.${NC}"; log_action "3XUI STOP"
-    read -p "Enter..."
-}
-
-rekey_warp_3xui() {
-    is_warp_installed_3xui || { echo -e "\n${RED}WARP не установлен.${NC}"; read -p "Enter..."; return; }
-    echo -e "\n${CYAN}━━━ Перевыпуск ключа WARP ━━━${NC}\n"
-    read -p "Продолжить? (y/n): " c; [[ "$c" != "y" ]] && return
-    echo -e "${YELLOW}[1/4]${NC} Отключение..."; warp-cli --accept-tos disconnect > /dev/null 2>&1; echo -e "${GREEN}  ✓${NC}"
-    echo -e "${YELLOW}[2/4]${NC} Удаление регистрации..."; warp-cli --accept-tos registration delete > /dev/null 2>&1; echo -e "${GREEN}  ✓${NC}"
-    echo -e "${YELLOW}[3/4]${NC} Новая регистрация..."; warp-cli --accept-tos registration new > /dev/null 2>&1 || { echo -e "${RED}Ошибка.${NC}"; read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
-    echo -e "${YELLOW}[4/4]${NC} Подключение..."
-    warp-cli --accept-tos mode proxy > /dev/null 2>&1; warp-cli --accept-tos proxy port "${SOCKS_PORT}" > /dev/null 2>&1
-    warp-cli --accept-tos connect > /dev/null 2>&1; sleep 3
-    if is_warp_running_3xui; then
-        local wip; wip=$(get_warp_ip_3xui)
-        echo -e "${GREEN}  ✓ Новый WARP IP: ${wip}${NC}"; log_action "3XUI REKEY: warp_ip=${wip}"
-    else echo -e "${YELLOW}  ⚠ Подключение не подтверждено.${NC}"; fi
-    read -p "Enter..."
-}
-
-# ═══════════════════════════════════════════════════════════════
-#  НОВАЯ ФУНКЦИЯ: Смена IP Cloudflare (3X-UI)
-# ═══════════════════════════════════════════════════════════════
-
-change_warp_ip_3xui() {
-    is_warp_installed_3xui || { echo -e "\n${RED}WARP не установлен.${NC}"; read -p "Enter..."; return; }
-    echo -e "\n${CYAN}━━━ Смена IP Cloudflare WARP (3X-UI) ━━━${NC}\n"
-
-    local old_ip; old_ip=$(get_warp_ip_3xui)
-    echo -e "  ${WHITE}Текущий IP:${NC} ${GREEN}${old_ip}${NC}\n"
-
-    read -p "Продолжить? (y/n): " c; [[ "$c" != "y" ]] && return
-
-    local max_attempts=5
-    local attempt=0
-    local new_ip=""
-
-    while [ $attempt -lt $max_attempts ]; do
-        ((attempt++))
-        echo -e "\n  ${YELLOW}[Попытка ${attempt}/${max_attempts}]${NC} Смена IP..."
-        if rotate_warp_ip_once_3xui; then
-            new_ip="$ROTATE_LAST_IP"
-        else
-            new_ip="$ROTATE_LAST_IP"
-            echo -e "  ${YELLOW}⚠ Ошибка попытки: ${ROTATE_LAST_ERROR:-unknown}. Пробую ещё...${NC}"
-            continue
-        fi
-
-        if is_ip_changed "$old_ip" "$new_ip"; then
-            echo -e "  ${GREEN}✓ IP успешно изменён!${NC}"
-            echo -e "  ${WHITE}Было:${NC}  ${YELLOW}${old_ip}${NC}"
-            echo -e "  ${WHITE}Стало:${NC} ${GREEN}${new_ip}${NC}"
-            log_action "3XUI CHANGE_IP: old=${old_ip}, new=${new_ip}, attempts=${attempt}"
-            read -p "Enter..."; return
-        else
-            echo -e "  ${YELLOW}⚠ IP не изменился (${new_ip}). Пробую ещё...${NC}"
-        fi
-    done
-
-    echo -e "\n  ${RED}✗ Не удалось сменить IP за ${max_attempts} попыток.${NC}"
-    echo -e "  ${WHITE}Попробуйте позже или используйте WARP+ лицензию.${NC}"
-    log_action "3XUI CHANGE_IP FAILED: old=${old_ip}, attempts=${max_attempts}"
-    read -p "Enter..."
-}
-
-change_port_3xui() {
-    is_warp_installed_3xui || { echo -e "\n${RED}WARP не установлен.${NC}"; read -p "Enter..."; return; }
-    echo -e "\n${CYAN}━━━ Изменение порта ━━━${NC}\n"
-    echo -e "${WHITE}Текущий: ${GREEN}${SOCKS_PORT}${NC}\n"
-    local np
-    while true; do
-        read -p "Новый порт (1024-65535): " np
-        [[ "$np" =~ ^[0-9]+$ ]] && (( np >= 1024 && np <= 65535 )) && break
-        echo -e "${RED}Ошибка.${NC}"
-    done
-    warp-cli --accept-tos proxy port "$np" > /dev/null 2>&1
-    save_config_val "SOCKS_PORT" "$np"; SOCKS_PORT="$np"
-    echo -e "\n${GREEN}[OK] Порт: ${np}${NC}\n${YELLOW}Обновите порт в 3X-UI!${NC}"
-    log_action "3XUI PORT: ${np}"; read -p "Enter..."
-}
-
-show_3xui_menu() {
-    while true; do
-        clear
-        echo -e "\n${CYAN}━━━ Настройки SOCKS5 для 3X-UI ━━━${NC}\n"
-        echo -e "  ${WHITE}SOCKS5-прокси:${NC} ${GREEN}127.0.0.1:${SOCKS_PORT}${NC}"
-        if is_warp_running_3xui; then
-            echo -e "  ${WHITE}WARP IP:${NC}       ${GREEN}$(get_warp_ip_3xui)${NC}"
-        fi
-        echo -e "\n  1) 📋 Показать JSON Outbound и Routing"
-        echo -e "  2) 📖 Пошаговая инструкция для 3X-UI"
-        echo -e "  3) 🔧 Изменить порт SOCKS5 (сейчас: ${SOCKS_PORT})"
-        echo -e "  4) 🔄 Сменить IP Cloudflare WARP"
-        echo -e "  0) ⬅️  Назад"
-        echo ""
-        read -p "  Выбор: " ch
-        case $ch in
-            1) show_3xui_json ;;
-            2) show_3xui_guide ;;
-            3) change_port_3xui ;;
-            4) change_warp_ip_3xui ;;
-            0) return ;;
-        esac
-    done
-}
-
-show_3xui_json() {
-    clear; echo -e "\n${CYAN}━━━ JSON для 3X-UI ━━━${NC}\n"
-    echo -e "${WHITE}Добавьте в ${YELLOW}Xray Settings → Outbounds${WHITE} (JSON):${NC}\n"
-    echo -e "${GREEN}── 1. Outbound (добавить в массив outbounds) ──${NC}\n"
-    cat <<EOF
-{
-  "tag": "warp",
-  "protocol": "socks",
-  "settings": {
-    "servers": [
-      {
-        "address": "127.0.0.1",
-        "port": ${SOCKS_PORT}
-      }
-    ]
-  }
-}
-EOF
-
-    echo -e "\n${GREEN}── 2. Routing Rule (маршруты через WARP) ──${NC}\n"
-    echo -e "${WHITE}Только определённые сайты через WARP:${NC}\n"
-    cat <<EOF
-{
-  "outboundTag": "warp",
-  "domain": [
-    "geosite:openai",
-    "geosite:netflix",
-    "geosite:disney",
-    "geosite:spotify",
-    "domain:chat.openai.com",
-    "domain:claude.ai"
-  ]
-}
-EOF
-
-    echo -e "\n${WHITE}Весь трафик через WARP:${NC}\n"
-    cat <<EOF
-{
-  "outboundTag": "warp",
-  "network": "tcp,udp"
-}
-EOF
-
-    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  ${WHITE}SOCKS5:${NC}  ${GREEN}127.0.0.1:${SOCKS_PORT}${NC}"
-    if is_warp_running_3xui; then
-        echo -e "  ${WHITE}WARP IP:${NC} ${GREEN}$(get_warp_ip_3xui)${NC}"
-    fi
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""; read -p "Enter..."
-}
-
-show_3xui_guide() {
-    clear; echo -e "\n${CYAN}━━━ Пошаговая настройка 3X-UI ━━━${NC}\n"
-
-    echo -e "${YELLOW}═══ ДОБАВЛЕНИЕ OUTBOUND ═══${NC}\n"
-    echo -e "${YELLOW}Шаг 1.${NC} Откройте панель 3X-UI в браузере"
-    echo -e "${YELLOW}Шаг 2.${NC} Перейдите в ${WHITE}Настройки Xray${NC} → ${WHITE}Outbounds${NC}"
-    echo -e "${YELLOW}Шаг 3.${NC} Нажмите ${GREEN}+ Добавить Outbound${NC}"
-    echo -e "${YELLOW}Шаг 4.${NC} Заполните поля в форме:"
-    echo -e ""
-    echo -e "  ${WHITE}Тег (Tag):${NC}      ${GREEN}warp${NC}"
-    echo -e "  ${WHITE}Протокол:${NC}       ${GREEN}SOCKS${NC}"
-    echo -e "  ${WHITE}Адрес сервера:${NC}  ${GREEN}127.0.0.1${NC}"
-    echo -e "  ${WHITE}Порт:${NC}           ${GREEN}${SOCKS_PORT}${NC}"
-    echo -e ""
-    echo -e "  ${DIM}Если панель требует JSON, вставьте в редактор:${NC}"
-    echo -e "  ${CYAN}(пункт 1 основного подменю показывает полный JSON)${NC}"
-    echo -e ""
-
-    echo -e "${YELLOW}═══ МАРШРУТИЗАЦИЯ (по желанию) ═══${NC}\n"
-    echo -e "  ${DIM}По умолчанию WARP не используется пока нет маршрутизации.${NC}"
-    echo -e "  ${DIM}Добавьте правило, чтобы указать какие сайты идут через WARP:${NC}\n"
-    echo -e "${YELLOW}Шаг 5.${NC} Перейдите в ${WHITE}Настройки Xray${NC} → ${WHITE}Routing Rules${NC}"
-    echo -e "${YELLOW}Шаг 6.${NC} Нажмите ${GREEN}+ Добавить правило${NC}"
-    echo -e "${YELLOW}Шаг 7.${NC} Заполните:"
-    echo -e ""
-    echo -e "  ${WHITE}Outbound Tag:${NC}   ${GREEN}warp${NC}"
-    echo -e "  ${WHITE}Domain:${NC}"
-    echo -e "    ${GREEN}geosite:openai${NC}"
-    echo -e "    ${GREEN}geosite:netflix${NC}"
-    echo -e "    ${GREEN}geosite:disney${NC}"
-    echo -e "    ${GREEN}geosite:spotify${NC}"
-    echo -e "    ${GREEN}domain:chat.openai.com${NC}"
-    echo -e "    ${GREEN}domain:claude.ai${NC}"
-    echo -e ""
-    echo -e "  ${DIM}Каждый домен на отдельной строке.${NC}"
-    echo -e "  ${DIM}Можно добавить свои домены или использовать network: tcp,udp для всего трафика.${NC}"
-    echo -e ""
-
-    echo -e "${YELLOW}═══ ПРИМЕНЕНИЕ ═══${NC}\n"
-    echo -e "${YELLOW}Шаг 8.${NC} Нажмите ${WHITE}Сохранить${NC}"
-    echo -e "${YELLOW}Шаг 9.${NC} Нажмите ${WHITE}Перезапустить Xray${NC} (или в SSH: ${GREEN}x-ui restart${NC})"
-    echo -e ""
-
-    echo -e "${YELLOW}═══ ПРОВЕРКА ═══${NC}\n"
-    echo -e "  1. Подключитесь к VPN через клиент"
-    echo -e "  2. Откройте ${CYAN}https://whoer.net${NC} или ${CYAN}https://ifconfig.me${NC}"
-    echo -e "  3. Сайты из списка → ${GREEN}IP Cloudflare${NC}"
-    echo -e "     Остальные сайты → ${WHITE}IP вашего сервера${NC}"
-    echo -e ""
-    echo -e "  ${WHITE}Проверка через SSH:${NC}"
-    echo -e "  ${GREEN}curl -s --proxy socks5h://127.0.0.1:${SOCKS_PORT} ifconfig.me${NC}"
-    echo -e ""
-
-    echo -e "${YELLOW}═══ TRUSTTUNNEL ═══${NC}\n"
-    echo -e "  ${DIM}Если вы используете TrustTunnel endpoint на этом же сервере,${NC}"
-    echo -e "  ${DIM}его исходящий трафик можно пустить через локальный SOCKS5 WARP.${NC}\n"
-    echo -e "${YELLOW}Шаг 1.${NC} Убедитесь, что WARP запущен и SOCKS5 доступен на ${GREEN}127.0.0.1:${SOCKS_PORT}${NC}"
-    echo -e "${YELLOW}Шаг 2.${NC} Откройте конфиг TrustTunnel ${WHITE}vpn.toml${NC}"
-    echo -e "${YELLOW}Шаг 3.${NC} Замените direct forwarding на SOCKS5 forwarding:"
-    echo -e ""
-    cat <<EOF
-[forward_protocol.socks5]
-address = "127.0.0.1:${SOCKS_PORT}"
-extended_auth = false
-EOF
-    echo -e ""
-    echo -e "${YELLOW}Шаг 4.${NC} Перезапустите TrustTunnel endpoint"
-    echo -e "  ${GREEN}systemctl restart trusttunnel${NC}"
-    echo -e ""
-    echo -e "${YELLOW}Шаг 5.${NC} Проверьте внешний IP клиентского трафика"
-    echo -e "  ${DIM}После этого TrustTunnel будет форвардить исходящие соединения через WARP.${NC}"
-    echo ""; read -p "Enter..."
-}
-
-show_status_3xui() {
-    clear; echo -e "\n${CYAN}━━━ Статус WARP (3X-UI) ━━━${NC}\n"
-    if ! is_warp_installed_3xui; then
-        echo -e "  ${RED}Не установлен.${NC} Установите через п.1."; echo ""; read -p "Enter..."; return
-    fi
-    local st; st=$(get_warp_status_3xui)
-    local sc="$RED"; [[ "$st" == "Подключён" ]] && sc="$GREEN"; [[ "$st" == "Отключён" ]] && sc="$YELLOW"
-    echo -e "  ${WHITE}Статус:      ${sc}${st}${NC}"
-    echo -e "  ${WHITE}Реальный IP: ${GREEN}${MY_IP}${NC}"
-    is_warp_running_3xui && echo -e "  ${WHITE}WARP IP:     ${GREEN}$(get_warp_ip_3xui)${NC}"
-
-    echo -e "\n${CYAN}── Настройки SOCKS5-прокси ──${NC}\n"
-    echo -e "  ${WHITE}Адрес:${NC}  ${GREEN}127.0.0.1${NC}"
-    echo -e "  ${WHITE}Порт:${NC}   ${GREEN}${SOCKS_PORT}${NC}"
-    echo -e "  ${WHITE}Прокси:${NC} ${CYAN}socks5h://127.0.0.1:${SOCKS_PORT}${NC}"
-
-    echo -e "\n${CYAN}── JSON Outbound для 3X-UI (скопируйте в панель) ──${NC}\n"
-    echo -e "${GREEN}"
-    cat <<EOF
-{
-  "tag": "warp",
-  "protocol": "socks",
-  "settings": {
-    "servers": [
-      {
-        "address": "127.0.0.1",
-        "port": ${SOCKS_PORT}
-      }
-    ]
-  }
-}
-EOF
-    echo -e "${NC}"
-
-    echo -e "${CYAN}── warp-cli status ──${NC}"
-    warp-cli --accept-tos status 2>/dev/null | while IFS= read -r l; do echo -e "  ${WHITE}$l${NC}"; done
-    echo ""; read -p "Enter..."
-}
-
-uninstall_3xui() {
-    echo -e "\n${YELLOW}Удаление WARP (3X-UI)...${NC}\n"
-    systemctl stop warp-bot 2>/dev/null; systemctl disable warp-bot 2>/dev/null
-    rm -f /etc/systemd/system/warp-bot.service; systemctl daemon-reload 2>/dev/null
-    [ -f "$BOT_PID_FILE" ] && { kill "$(cat "$BOT_PID_FILE")" 2>/dev/null; rm -f "$BOT_PID_FILE"; }
-    echo -e "  ${GREEN}✓${NC}  Бот остановлен"
-    warp-cli --accept-tos disconnect > /dev/null 2>&1; echo -e "  ${GREEN}✓${NC}  WARP отключён"
-    warp-cli --accept-tos registration delete > /dev/null 2>&1; echo -e "  ${GREEN}✓${NC}  Регистрация удалена"
-    apt-get remove -y cloudflare-warp > /dev/null 2>&1; apt-get autoremove -y > /dev/null 2>&1; echo -e "  ${GREEN}✓${NC}  Пакет удалён"
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    echo -e "  ${GREEN}✓${NC}  Репозиторий удалён"
-}
-
-# ═══════════════════════════════════════════════════════════════
-#  STANDALONE MODE — WARP via warp-cli (no panels)
-# ═══════════════════════════════════════════════════════════════
 
 is_warp_installed_standalone() { command -v warp-cli &>/dev/null; }
 
@@ -864,6 +646,27 @@ uninstall_standalone() {
 #  AMNEZIA BACKEND — WARP via wgcf (WireGuard inside Docker)
 # ═══════════════════════════════════════════════════════════════
 
+rotate_warp_ip_once_awg() {
+    ROTATE_LAST_IP="N/A"
+    ROTATE_LAST_ERROR=""
+    docker exec "$CONTAINER" sh -c "wg-quick down '$AWG_WARP_CONF' 2>/dev/null || true"
+    sleep 2
+    rm -f "$WGCF_ACCOUNT"
+    wgcf_ensure_account || { ROTATE_LAST_ERROR="registration"; return 1; }
+    wgcf_generate_profile || { ROTATE_LAST_ERROR="profile"; return 1; }
+    local ep
+    ep=$(wgcf_resolve_endpoint) || { ROTATE_LAST_ERROR="endpoint"; return 1; }
+    awg_build_warp_conf "$ep" || { ROTATE_LAST_ERROR="build_conf"; return 1; }
+    awg_warp_up > /dev/null 2>&1 || { ROTATE_LAST_ERROR="connect"; return 1; }
+    sleep 3
+    awg_apply_rules
+    awg_patch_start_sh
+    awg_detect_warp_exit_ip
+    ROTATE_LAST_IP="${AWG_WARP_EXIT_IP:-N/A}"
+    is_valid_warp_ip "$ROTATE_LAST_IP" || { ROTATE_LAST_ERROR="ip_unavailable"; return 1; }
+    return 0
+}
+
 awg_discover_containers() {
     AWG_ALL_CONTAINERS=()
     mapfile -t AWG_ALL_CONTAINERS < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^amnezia-awg2$|^amnezia-awg$' || true)
@@ -987,38 +790,6 @@ awg_backup() {
     log_action "AWG BACKUP: $ts"
 }
 
-awg_install_wgcf() {
-    if [ -x "$WGCF_BIN" ]; then return 0; fi
-    local arch; arch=$(uname -m)
-    local wa=""
-    case "$arch" in
-        x86_64) wa="amd64" ;; aarch64) wa="arm64" ;; armv7l) wa="armv7" ;;
-        *) echo -e "${RED}Архитектура не поддерживается: $arch${NC}"; return 1 ;;
-    esac
-    wget -q -O "$WGCF_BIN" "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${wa}" \
-        || { echo -e "${RED}Не удалось скачать wgcf.${NC}"; return 1; }
-    chmod +x "$WGCF_BIN"
-}
-
-awg_ensure_account() {
-    if [ ! -f "$WGCF_ACCOUNT" ]; then
-        echo -e "${YELLOW}Регистрация WARP через wgcf...${NC}"
-        (cd /root && yes | ./wgcf register 2>/dev/null)
-    fi
-    [ -f "$WGCF_ACCOUNT" ] || { echo -e "${RED}Не создан $WGCF_ACCOUNT${NC}"; return 1; }
-}
-
-awg_generate_profile() {
-    (cd /root && yes | ./wgcf generate 2>/dev/null)
-    [ -f "$WGCF_PROFILE" ] || { echo -e "${RED}Не создан профиль.${NC}"; return 1; }
-}
-
-awg_resolve_endpoint() {
-    local ep; ep=$(getent ahostsv4 engage.cloudflareclient.com 2>/dev/null | awk 'NR==1{print $1}')
-    [ -z "$ep" ] && { echo -e "${RED}Не удалось определить IP endpoint.${NC}"; return 1; }
-    echo "$ep"
-}
-
 awg_build_warp_conf() {
     local endpoint_ip="$1"
     local pk pub addr
@@ -1055,16 +826,16 @@ install_warp_awg() {
     awg_discover_containers 2>/dev/null || { read -p "Enter..."; return; }
 
     echo -e "${YELLOW}[1/5]${NC} Скачиваю wgcf..."
-    awg_install_wgcf || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+    wgcf_install || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
 
     echo -e "${YELLOW}[2/5]${NC} Регистрация WARP..."
-    awg_ensure_account || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+    wgcf_ensure_account || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
 
     echo -e "${YELLOW}[3/5]${NC} Генерация профиля..."
-    awg_generate_profile || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+    wgcf_generate_profile || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
 
     echo -e "${YELLOW}[4/5]${NC} Определение endpoint..."
-    local ep; ep=$(awg_resolve_endpoint) || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓ ${ep}${NC}"
+    local ep; ep=$(wgcf_resolve_endpoint) || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓ ${ep}${NC}"
 
     echo -e "${YELLOW}[5/5]${NC} Установка на контейнеры...\n"
     local saved_container="${CONTAINER:-}"
@@ -1118,10 +889,10 @@ rekey_warp_awg() {
     read -p "Продолжить? (y/n): " c; [[ "$c" != "y" ]] && return
     echo -e "${YELLOW}[1/5]${NC} Остановка warp..."; docker exec "$CONTAINER" sh -c "wg-quick down '$AWG_WARP_CONF' 2>/dev/null || true"; echo -e "${GREEN}  ✓${NC}"
     echo -e "${YELLOW}[2/5]${NC} Удаление аккаунта..."; rm -f "$WGCF_ACCOUNT"; echo -e "${GREEN}  ✓${NC}"
-    echo -e "${YELLOW}[3/5]${NC} Новая регистрация..."; awg_ensure_account || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
-    echo -e "${YELLOW}[4/5]${NC} Генерация профиля..."; awg_generate_profile || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+    echo -e "${YELLOW}[3/5]${NC} Новая регистрация..."; wgcf_ensure_account || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
+    echo -e "${YELLOW}[4/5]${NC} Генерация профиля..."; wgcf_generate_profile || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
     echo -e "${YELLOW}[5/5]${NC} Пересборка и запуск..."
-    local ep; ep=$(awg_resolve_endpoint) || { read -p "Enter..."; return; }
+    local ep; ep=$(wgcf_resolve_endpoint) || { read -p "Enter..."; return; }
     awg_build_warp_conf "$ep"
     awg_warp_up || { read -p "Enter..."; return; }
     awg_apply_rules
@@ -1132,10 +903,6 @@ rekey_warp_awg() {
     log_action "AWG REKEY: warp_ip=${AWG_WARP_EXIT_IP}"
     read -p "Enter..."
 }
-
-# ═══════════════════════════════════════════════════════════════
-#  НОВАЯ ФУНКЦИЯ: Смена IP Cloudflare (AmneziaWG)
-# ═══════════════════════════════════════════════════════════════
 
 change_warp_ip_awg() {
     is_warp_installed_awg || { echo -e "\n${RED}WARP не установлен.${NC}"; read -p "Enter..."; return; }
@@ -1671,9 +1438,8 @@ kbd_main_3xui() {
     cat <<'JSON'
 [
   [{"text":"📊 Статус","callback_data":"st"},{"text":"🌐 IP","callback_data":"ip"}],
-  [{"text":"▶️ Запустить","callback_data":"on"},{"text":"⏹ Остановить","callback_data":"off"}],
-  [{"text":"🔑 Перевыпуск","callback_data":"rk"},{"text":"🔄 Сменить IP","callback_data":"cip"}],
-  [{"text":"📋 JSON 3X-UI","callback_data":"js"}],
+  [{"text":"▶️ Встроить в Xray","callback_data":"on"},{"text":"⏹ Удалить из Xray","callback_data":"off"}],
+  [{"text":"🔑 Перевыпуск / Смена IP","callback_data":"rk"}],
   [{"text":"💻 Система","callback_data":"sys"}]
 ]
 JSON
@@ -1708,8 +1474,7 @@ kbd_main_both() {
   [{"text":"📊 Статус","callback_data":"st"},{"text":"🌐 IP","callback_data":"ip"}],
   [{"text":"▶️ Запустить","callback_data":"on"},{"text":"⏹ Остановить","callback_data":"off"}],
   [{"text":"🔑 Перевыпуск","callback_data":"rk"},{"text":"🔄 Сменить IP","callback_data":"cip"}],
-  [{"text":"📋 JSON 3X-UI","callback_data":"js"},{"text":"👥 Клиенты AWG","callback_data":"cl"}],
-  [{"text":"🔄 Контейнер","callback_data":"rc"}],
+  [{"text":"👥 Клиенты AWG","callback_data":"cl"},{"text":"🔄 Контейнер","callback_data":"rc"}],
   [{"text":"💻 Система","callback_data":"sys"}]
 ]
 JSON
@@ -1732,16 +1497,16 @@ bot_main_menu() {
     local ws wip="" extra=""
     ws=$(get_warp_status)
     is_warp_running && wip=" | WARP IP: $(get_warp_ip)"
-    if has_3xui_mode; then extra+="\nSOCKS5: <code>127.0.0.1:${SOCKS_PORT}</code>"; fi
+    if has_standalone_mode; then extra+="\nSOCKS5: <code>127.0.0.1:${SOCKS_PORT}</code>"; fi
     if has_awg_mode; then
         awg_discover_containers 2>/dev/null
         for _c in "${AWG_ALL_CONTAINERS[@]}"; do
             extra+="\n📦 <code>${_c}</code>"
         done
     fi
-    local mode_label="3X-UI"
+    local mode_label="3X-UI Native"
     [ "$MODE" = "amnezia" ] && mode_label="AmneziaWG"
-    [ "$MODE" = "both" ] && mode_label="3X-UI + AWG"
+    [ "$MODE" = "both" ] && mode_label="3X-UI Native + AWG"
     [ "$MODE" = "standalone" ] && mode_label="Standalone"
     local text="<b>WARP Manager v${WARP_VERSION}</b> (${mode_label})\nСервер: <code>${MY_IP:-N/A}</code>\nСтатус: <b>${ws}</b>${wip}${extra}\n\nВыберите:"
     local kbd; kbd=$(kbd_main)
@@ -1765,7 +1530,7 @@ bot_handle_callback() {
             local ws wip="" extra=""
             ws=$(get_warp_status)
             is_warp_running && wip="\nWARP IP: <code>$(get_warp_ip)</code>"
-            if has_3xui_mode; then
+            if has_standalone_mode; then
                 extra+="\nSOCKS5: <code>127.0.0.1:${SOCKS_PORT}</code>"
                 local raw; raw=$(warp-cli --accept-tos status 2>/dev/null | head -3)
                 [ -n "$raw" ] && extra+="\n\n<pre>${raw}</pre>"
@@ -1784,17 +1549,17 @@ bot_handle_callback() {
         ip)
             local wip="N/A"; is_warp_running && wip=$(get_warp_ip)
             local t="🌐 <b>IP адреса</b>\n\n<b>Реальный:</b> <code>${MY_IP:-N/A}</code>\n<b>WARP:</b> <code>${wip}</code>"
-            if has_3xui_mode; then t+="\n<b>SOCKS5:</b> <code>127.0.0.1:${SOCKS_PORT}</code>"; fi
+            if has_standalone_mode; then t+="\n<b>SOCKS5:</b> <code>127.0.0.1:${SOCKS_PORT}</code>"; fi
             tg_edit "$chat_id" "$msg_id" "$t" "$(kbd_back)" ;;
 
         on)
             tg_edit "$chat_id" "$msg_id" "⏳ Запуск..." ""
             local result=""
-            if has_3xui_mode && is_warp_installed_3xui; then
-                warp-cli --accept-tos connect > /dev/null 2>&1; sleep 3
+            if has_3xui_mode; then
+                install_warp_3xui >/dev/null 2>&1
                 if is_warp_running_3xui; then
-                    result+="✅ 3X-UI: $(get_warp_ip_3xui)\n"; log_action "BOT 3XUI ON"
-                else result+="❌ 3X-UI: ошибка\n"; fi
+                    result+="✅ 3X-UI: Внедрено в Xray\n"; log_action "BOT 3XUI ON (Native)"
+                else result+="❌ 3X-UI: ошибка внедрения\n"; fi
             fi
             if has_standalone_mode && is_warp_installed_standalone; then
                 warp-cli --accept-tos connect > /dev/null 2>&1; sleep 3
@@ -1815,8 +1580,8 @@ bot_handle_callback() {
         off)
             local result=""
             if has_3xui_mode && is_warp_running_3xui 2>/dev/null; then
-                warp-cli --accept-tos disconnect > /dev/null 2>&1
-                result+="⏹ 3X-UI отключён\n"; log_action "BOT 3XUI OFF"
+                stop_warp_3xui >/dev/null 2>&1
+                result+="⏹ 3X-UI: WARP удален из БД\n"; log_action "BOT 3XUI OFF (Native)"
             fi
             if has_standalone_mode && is_warp_running_standalone 2>/dev/null; then
                 warp-cli --accept-tos disconnect > /dev/null 2>&1
@@ -1836,16 +1601,16 @@ bot_handle_callback() {
             tg_edit "$chat_id" "$msg_id" "⏳ Перевыпуск..." ""
             local result=""
             if has_3xui_mode; then
-                warp-cli --accept-tos disconnect > /dev/null 2>&1
-                warp-cli --accept-tos registration delete > /dev/null 2>&1
-                warp-cli --accept-tos registration new > /dev/null 2>&1
-                warp-cli --accept-tos mode proxy > /dev/null 2>&1
-                warp-cli --accept-tos proxy port "${SOCKS_PORT}" > /dev/null 2>&1
-                warp-cli --accept-tos connect > /dev/null 2>&1; sleep 3
-                if is_warp_running_3xui; then
-                    local w; w=$(get_warp_ip_3xui)
-                    result+="✅ 3X-UI: <code>${w}</code>\n"; log_action "BOT 3XUI REKEY: ${w}"
-                else result+="⚠️ 3X-UI: не подтверждено\n"; fi
+                rm -f "$WGCF_ACCOUNT"
+                if (cd /root && yes | ./wgcf register 2>/dev/null && yes | ./wgcf generate 2>/dev/null); then
+                    stop_warp_3xui > /dev/null 2>&1
+                    install_warp_3xui > /dev/null 2>&1
+                    if is_warp_running_3xui; then
+                        result+="✅ 3X-UI: Новый профиль интегрирован\n"; log_action "BOT 3XUI REKEY Native"
+                    else result+="⚠️ 3X-UI: не подтверждено\n"; fi
+                else
+                    result+="❌ 3X-UI: ошибка wgcf\n"
+                fi
             fi
             if has_standalone_mode; then
                 warp-cli --accept-tos disconnect > /dev/null 2>&1
@@ -1864,7 +1629,7 @@ bot_handle_callback() {
                 rm -f "$WGCF_ACCOUNT"
                 (cd /root && yes | ./wgcf register 2>/dev/null && yes | ./wgcf generate 2>/dev/null)
                 if [ -f "$WGCF_PROFILE" ]; then
-                    local ep; ep=$(awg_resolve_endpoint 2>/dev/null)
+                    local ep; ep=$(wgcf_resolve_endpoint 2>/dev/null)
                     if [ -n "$ep" ]; then
                         awg_build_warp_conf "$ep"
                         awg_warp_up 2>/dev/null
@@ -1881,25 +1646,8 @@ bot_handle_callback() {
             local result=""
             local max_attempts=5
             local attempt
-            if has_3xui_mode && is_warp_installed_3xui; then
-                local old_ip; old_ip=$(get_warp_ip_3xui)
-                local new_ip="N/A"
-                for ((attempt=1; attempt<=max_attempts; attempt++)); do
-                    rotate_warp_ip_once_3xui || true
-                    new_ip="$ROTATE_LAST_IP"
-                    is_ip_changed "$old_ip" "$new_ip" && break
-                done
-                if is_ip_changed "$old_ip" "$new_ip"; then
-                    result+="✅ 3X-UI IP изменён\n"
-                    result+="Было: <code>${old_ip}</code>\n"
-                    result+="Стало: <code>${new_ip}</code>\n"
-                    result+="Попыток: <code>${attempt}</code>\n"
-                    log_action "BOT 3XUI CHANGE_IP: ${old_ip} -> ${new_ip} in ${attempt} attempts"
-                else
-                    result+="⚠️ 3X-UI: IP не изменился\n"
-                    result+="Последний IP: <code>${new_ip}</code>\n"
-                    result+="Последняя ошибка: <code>${ROTATE_LAST_ERROR:-same_ip}</code>\n"
-                fi
+            if has_3xui_mode; then
+                result+="✅ 3X-UI: Для смены IP нажмите [Перевыпуск / Смена IP] (генерирует новый аккаунт)\n"
             fi
             if has_standalone_mode && is_warp_installed_standalone; then
                 local old_ip; old_ip=$(get_warp_ip_standalone)
@@ -1910,15 +1658,10 @@ bot_handle_callback() {
                     is_ip_changed "$old_ip" "$new_ip" && break
                 done
                 if is_ip_changed "$old_ip" "$new_ip"; then
-                    result+="✅ WARP IP изменён\n"
-                    result+="Было: <code>${old_ip}</code>\n"
-                    result+="Стало: <code>${new_ip}</code>\n"
-                    result+="Попыток: <code>${attempt}</code>\n"
+                    result+="✅ WARP IP изменён\nБыло: <code>${old_ip}</code>\nСтало: <code>${new_ip}</code>\nПопыток: <code>${attempt}</code>\n"
                     log_action "BOT STANDALONE CHANGE_IP: ${old_ip} -> ${new_ip} in ${attempt} attempts"
                 else
-                    result+="⚠️ WARP: IP не изменился\n"
-                    result+="Последний IP: <code>${new_ip}</code>\n"
-                    result+="Последняя ошибка: <code>${ROTATE_LAST_ERROR:-same_ip}</code>\n"
+                    result+="⚠️ WARP: IP не изменился\nПоследний IP: <code>${new_ip}</code>\nПоследняя ошибка: <code>${ROTATE_LAST_ERROR:-same_ip}</code>\n"
                 fi
             fi
             if has_awg_mode && is_warp_installed_awg; then
@@ -1931,27 +1674,14 @@ bot_handle_callback() {
                     is_ip_changed "$old_ip" "$new_ip" && break
                 done
                 if is_ip_changed "$old_ip" "$new_ip"; then
-                    result+="✅ AWG IP изменён\n"
-                    result+="Было: <code>${old_ip}</code>\n"
-                    result+="Стало: <code>${new_ip}</code>\n"
-                    result+="Попыток: <code>${attempt}</code>\n"
+                    result+="✅ AWG IP изменён\nБыло: <code>${old_ip}</code>\nСтало: <code>${new_ip}</code>\nПопыток: <code>${attempt}</code>\n"
                     log_action "BOT AWG CHANGE_IP: ${old_ip} -> ${new_ip} in ${attempt} attempts"
                 else
-                    result+="⚠️ AWG: IP не изменился\n"
-                    result+="Последний IP: <code>${new_ip}</code>\n"
-                    result+="Последняя ошибка: <code>${ROTATE_LAST_ERROR:-same_ip}</code>\n"
+                    result+="⚠️ AWG: IP не изменился\nПоследний IP: <code>${new_ip}</code>\nПоследняя ошибка: <code>${ROTATE_LAST_ERROR:-same_ip}</code>\n"
                 fi
             fi
             [ -z "$result" ] && result="❌ WARP не установлен."
             tg_edit "$chat_id" "$msg_id" "🔄 <b>Смена IP Cloudflare</b>\n\n${result}" "$(kbd_back)" ;;
-
-        js)
-            if has_3xui_mode; then
-                local t="📋 <b>Конфигурация для 3X-UI</b>\n\n<b>Outbound:</b>\n<pre>{\n  \"tag\": \"warp\",\n  \"protocol\": \"socks\",\n  \"settings\": {\n    \"servers\": [{\"address\": \"127.0.0.1\", \"port\": ${SOCKS_PORT}}]\n  }\n}</pre>\n\n<b>Routing:</b>\n<pre>{\"outboundTag\": \"warp\", \"domain\": [\"geosite:openai\",\"geosite:netflix\"]}</pre>"
-                tg_edit "$chat_id" "$msg_id" "$t" "$(kbd_back)"
-            else
-                tg_edit "$chat_id" "$msg_id" "ℹ️ JSON не требуется для AmneziaWG." "$(kbd_back)"
-            fi ;;
 
         cl)
             awg_discover_containers 2>/dev/null
@@ -2074,7 +1804,7 @@ bot_handle_callback() {
             local ws; ws=$(get_warp_status)
             s+="\n<b>WARP:</b> ${ws}"
             s+="\n<b>Режим:</b> ${MODE}"
-            if has_3xui_mode; then s+="\n<b>SOCKS5:</b> 127.0.0.1:${SOCKS_PORT}"; fi
+            if has_standalone_mode; then s+="\n<b>SOCKS5:</b> 127.0.0.1:${SOCKS_PORT}"; fi
             if has_awg_mode; then
                 awg_discover_containers 2>/dev/null
                 for _c in "${AWG_ALL_CONTAINERS[@]}"; do
@@ -2298,13 +2028,12 @@ show_info() {
     echo -e "${MAGENTA}**********************************************************${NC}"
     echo ""
     if has_3xui_mode; then
-        echo -e "${CYAN}═══ 3X-UI ═══${NC}\n"
-        echo -e "${WHITE}  Клиент / сервис → SOCKS5 (WARP) → Cloudflare → Интернет${NC}\n"
-        echo -e "${GREEN}  1.${NC} cloudflare-warp установлен нативно"
-        echo -e "${GREEN}  2.${NC} SOCKS5-прокси на 127.0.0.1:${SOCKS_PORT}"
-        echo -e "${GREEN}  3.${NC} Подключите нужный клиент или сервис к SOCKS5-прокси WARP"
-        echo -e "${GREEN}  4.${NC} Подходит для 3X-UI, TrustTunnel и других совместимых решений"
-        echo -e "${GREEN}  5.${NC} Для TrustTunnel: в ${WHITE}vpn.toml${NC} используйте ${WHITE}[forward_protocol.socks5]${NC}"
+        echo -e "${CYAN}═══ 3X-UI Native WG ═══${NC}\n"
+        echo -e "${WHITE}  Клиент → Xray IN → Xray WG WARP Outbound → Cloudflare → Интернет${NC}\n"
+        echo -e "${GREEN}  1.${NC} wgcf генерирует профиль WARP."
+        echo -e "${GREEN}  2.${NC} Скрипт напрямую добавляет Wireguard Outbound в базу данных x-ui.db."
+        echo -e "${GREEN}  3.${NC} Маршрутизация настраивается правилами (Routing) прямо в панели 3x-ui."
+        echo -e "${GREEN}  4.${NC} Минимальное потребление ресурсов по сравнению с SOCKS5."
         echo ""
     fi
     if has_awg_mode; then
@@ -2314,6 +2043,7 @@ show_info() {
         echo -e "${GREEN}  2.${NC} WG-интерфейс warp внутри Docker-контейнера"
         echo -e "${GREEN}  3.${NC} Маршрутизация per-client через ip rule"
         echo -e "${GREEN}  4.${NC} Персистентность через start.sh контейнера"
+        echo ""
     fi
     if has_standalone_mode; then
         echo -e "${CYAN}═══ Standalone ═══${NC}\n"
@@ -2327,7 +2057,6 @@ show_info() {
     echo -e "${GREEN}  ✓${NC}  Чистый IP от Cloudflare"
     echo -e "${GREEN}  ✓${NC}  Telegram-бот"
     echo -e "${GREEN}  ✓${NC}  Бесплатно (Cloudflare WARP)"
-    echo -e "${GREEN}  ✓${NC}  Смена IP Cloudflare (п.5 в меню настроек)"
     echo ""; read -p "Enter..."
 }
 
@@ -2382,7 +2111,6 @@ full_uninstall() {
 
     echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}  WARP Manager полностью удалён.${NC}"
-    has_3xui_mode && echo -e "${WHITE}  Уберите outbound \"warp\" из 3X-UI!${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
     log_action "UNINSTALL: full removal ($MODE)"
     read -p "Enter..."
@@ -2398,7 +2126,7 @@ show_menu() {
         clear
         local st sc
         st=$(get_warp_status)
-        sc="$RED"; [[ "$st" == *"Подключён"* ]] && sc="$GREEN"; [[ "$st" == *"Отключён"* && "$st" != *"Подключён"* ]] && sc="$YELLOW"
+        sc="$RED"; [[ "$st" == *"Подключён"* || "$st" == *"Интегрирован"* ]] && sc="$GREEN"; [[ "$st" == *"Отключён"* && "$st" != *"Подключён"* && "$st" != *"Интегрирован"* ]] && sc="$YELLOW"
         local current_mode_label; current_mode_label=$(mode_label)
 
         echo -e "${MAGENTA}**********************************************************"
@@ -2406,7 +2134,7 @@ show_menu() {
         echo -e "**********************************************************${NC}"
         echo -e "  ${WHITE}IP сервера:${NC} ${GREEN}${MY_IP}${NC}   ${WHITE}Режим:${NC} ${CYAN}${current_mode_label}${NC}"
         echo -e "  ${WHITE}WARP:${NC} ${sc}${st}${NC}"
-        if has_3xui_mode && is_warp_running_3xui 2>/dev/null; then
+        if has_standalone_mode && is_warp_running_standalone 2>/dev/null; then
             echo -e "  ${WHITE}SOCKS5:${NC} ${CYAN}127.0.0.1:${SOCKS_PORT}${NC}"
         fi
         if has_awg_mode; then
@@ -2430,7 +2158,7 @@ show_menu() {
 
         if has_3xui_mode; then
             echo -e "\n${CYAN}── 3X-UI ──────────────────────────────────────────────${NC}"
-            echo -e "  6) 📋 ${CYAN}Настройки SOCKS5 / JSON / Инструкция${NC}"
+            echo -e "  6) 📋 ${CYAN}Настройки маршрутизации / Инструкция${NC}"
         fi
 
         if has_standalone_mode; then
